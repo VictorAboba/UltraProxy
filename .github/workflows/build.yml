@@ -39,7 +39,7 @@ jobs:
           XRAY_TARGETS: win32-x64,linux-x64
 
       - name: Package VSIX
-        run: npx vsce package --allow-missing-repository -o ultraproxy.vsix
+        run: npx vsce package -o ultraproxy.vsix
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4

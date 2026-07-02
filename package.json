@@ -5,6 +5,14 @@
   "version": "0.1.0",
   "publisher": "ultraproxy",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VictorAboba/UltraProxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/VictorAboba/UltraProxy/issues"
+  },
+  "homepage": "https://github.com/VictorAboba/UltraProxy#readme",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -338,7 +346,7 @@
     "watch": "tsc -watch -p ./",
     "test": "node test/selftest.js",
     "download-xray": "node scripts/download-xray.mjs",
-    "package": "npm run compile && npm run download-xray && vsce package --allow-missing-repository"
+    "package": "npm run compile && npm run download-xray && vsce package"
   },
   "dependencies": {
     "ssh2": "^1.16.0",
