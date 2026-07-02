@@ -1,6 +1,47 @@
+import { ExecProfile } from '../config/settings';
+
 /** POSIX single-quote a string for safe interpolation into a remote shell command. */
 export function shQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** The cluster exec-profile inputs needed to wrap a remote command. */
+export interface RemoteExecProfile {
+  profile: ExecProfile;
+  dockerContainer: string;
+  execTemplate: string;
+}
+
+/**
+ * Wrap a remote command per the cluster's exec profile so injection can target a container or a
+ * custom launcher instead of the SSH host directly:
+ *   direct — the command runs as-is on the SSH host (default; no change).
+ *   docker — `docker exec <container> bash -lc '<cmd>'` (injects into the container's $HOME).
+ *   custom — a user template whose `{{CMD}}` expands to `bash -lc '<cmd>'` (e.g. `sudo {{CMD}}`).
+ */
+export function wrapExec(cmd: string, p: RemoteExecProfile): string {
+  switch (p.profile) {
+    case 'docker': {
+      const c = p.dockerContainer.trim();
+      if (!c) {
+        throw new Error("execProfile is 'docker' but no dockerContainer is configured.");
+      }
+      return `docker exec ${shQuote(c)} bash -lc ${shQuote(cmd)}`;
+    }
+    case 'custom': {
+      const t = p.execTemplate.trim();
+      if (!t) {
+        throw new Error("execProfile is 'custom' but no execTemplate is configured.");
+      }
+      if (!t.includes('{{CMD}}')) {
+        throw new Error("execTemplate must contain the {{CMD}} placeholder (e.g. 'sudo {{CMD}}').");
+      }
+      return t.replace(/\{\{CMD\}\}/g, `bash -lc ${shQuote(cmd)}`);
+    }
+    case 'direct':
+    default:
+      return cmd;
+  }
 }
 
 /** Command that writes base64 content to an absolute path (dirs created). */
@@ -45,6 +86,115 @@ export function renderEnvFile(proxyUrl: string, noProxy: string): string {
     'export NODE_USE_ENV_PROXY=1',
     '# <<< UltraProxy (managed) <<<',
     '',
+  ].join('\n');
+}
+
+const SERVER_ENV_BEGIN = '# >>> UltraProxy server-env BEGIN <<<';
+const SERVER_ENV_END = '# >>> UltraProxy server-env END <<<';
+// awk program that drops any prior UltraProxy block (idempotent write / clean removal).
+const SERVER_ENV_STRIP = `awk '/^${SERVER_ENV_BEGIN}$/{s=1;next} /^${SERVER_ENV_END}$/{s=0;next} !s{print}'`;
+
+/** The proxy block written into ~/.vscode-server/server-env-setup (sourced by VSCode Server). */
+export function renderServerEnvBlock(proxyUrl: string, noProxyCsv: string): string {
+  return [
+    SERVER_ENV_BEGIN,
+    `export HTTPS_PROXY=${JSON.stringify(proxyUrl)}`,
+    `export HTTP_PROXY=${JSON.stringify(proxyUrl)}`,
+    `export NO_PROXY=${JSON.stringify(noProxyCsv)}`,
+    `export https_proxy=${JSON.stringify(proxyUrl)}`,
+    `export http_proxy=${JSON.stringify(proxyUrl)}`,
+    `export no_proxy=${JSON.stringify(noProxyCsv)}`,
+    'export NODE_USE_ENV_PROXY=1',
+    SERVER_ENV_END,
+    '',
+  ].join('\n');
+}
+
+/** Strip any prior UltraProxy block, then append the given (base64-encoded) block. Idempotent. */
+export function cmdWriteServerEnv(absPath: string, blockB64: string): string {
+  const dir = absPath.replace(/\/[^/]*$/, '') || '/';
+  const tmp = `${absPath}.up`;
+  return (
+    `mkdir -p ${shQuote(dir)} && touch ${shQuote(absPath)} && ` +
+    `${SERVER_ENV_STRIP} ${shQuote(absPath)} > ${shQuote(tmp)} && mv ${shQuote(tmp)} ${shQuote(absPath)} && ` +
+    `printf '%s' ${shQuote(blockB64)} | base64 -d >> ${shQuote(absPath)}`
+  );
+}
+
+/** Remove the UltraProxy block from server-env-setup; delete the file if it becomes empty. */
+export function cmdRemoveServerEnv(absPath: string): string {
+  const tmp = `${absPath}.up`;
+  return (
+    `if [ -f ${shQuote(absPath)} ]; then ` +
+    `${SERVER_ENV_STRIP} ${shQuote(absPath)} > ${shQuote(tmp)} && mv ${shQuote(tmp)} ${shQuote(absPath)}; ` +
+    `if [ ! -s ${shQuote(absPath)} ]; then rm -f ${shQuote(absPath)}; fi; ` +
+    `fi; true`
+  );
+}
+
+// Unique marker embedded in the shim so wrap/unwrap only ever touch our own replacement.
+const CLAUDE_SHIM_MARKER = 'ultraproxy-claude-wrapper';
+// The shim re-reads the live proxy URL from state on every launch, so a reconnect that changes the
+// port is picked up automatically. $HOME resolves to the same context the injection wrote into.
+const CLAUDE_SHIM = [
+  '#!/usr/bin/env bash',
+  `# ${CLAUDE_SHIM_MARKER}: injected by UltraProxy`,
+  'UP_STATE="$HOME/.ultraproxy"',
+  'if [ -f "$UP_STATE/proxy_url" ]; then',
+  '  UP_URL="$(cat "$UP_STATE/proxy_url" 2>/dev/null || true)"',
+  '  if [ -n "$UP_URL" ]; then',
+  '    export HTTPS_PROXY="$UP_URL" HTTP_PROXY="$UP_URL" https_proxy="$UP_URL" http_proxy="$UP_URL"',
+  '    if [ -f "$UP_STATE/no_proxy" ]; then',
+  '      UP_NP="$(cat "$UP_STATE/no_proxy" 2>/dev/null || true)"',
+  '      export NO_PROXY="$UP_NP" no_proxy="$UP_NP"',
+  '    fi',
+  '    export NODE_USE_ENV_PROXY=1',
+  '  fi',
+  'fi',
+  'exec "$(dirname "$0")/claude.real" "$@"',
+  '',
+].join('\n');
+
+// The shim is written via base64 decode (not a heredoc): a quoted heredoc delimiter does NOT survive
+// being re-wrapped as `bash -lc '<script>'` by the docker/custom exec profiles (shQuote mangles the
+// delimiter into an unquoted one, which would expand $HOME/$(...) at install time). A base64 blob has
+// no shell-significant characters, so it round-trips through any nesting unchanged.
+const CLAUDE_SHIM_B64 = Buffer.from(CLAUDE_SHIM, 'utf8').toString('base64');
+
+/**
+ * Wrap the Anthropic Claude Code extension's bundled `claude` binary under `extRoot` so it inherits
+ * the proxy env even when the extension host spawns it with a stripped environment. Idempotent:
+ * renames the real binary to `claude.real` once, then installs the shim.
+ */
+export function cmdWrapClaude(extRoot: string): string {
+  const glob = `${shQuote(extRoot)}/anthropic.claude-code-*`;
+  return [
+    `for d in ${glob}; do`,
+    '  [ -d "$d" ] || continue;',
+    '  bin="$d/resources/native-binary/claude";',
+    '  real="$d/resources/native-binary/claude.real";',
+    '  [ -f "$bin" ] || continue;',
+    `  if [ -f "$real" ] && grep -q ${CLAUDE_SHIM_MARKER} "$bin" 2>/dev/null; then continue; fi;`,
+    '  if [ ! -f "$real" ]; then mv "$bin" "$real"; else rm -f "$bin"; fi;',
+    `  printf '%s' ${shQuote(CLAUDE_SHIM_B64)} | base64 -d > "$bin";`,
+    '  chmod +x "$bin";',
+    'done; true',
+  ].join('\n');
+}
+
+/** Restore any Claude Code binaries we wrapped under `extRoot` (moves claude.real back). */
+export function cmdUnwrapClaude(extRoot: string): string {
+  const glob = `${shQuote(extRoot)}/anthropic.claude-code-*`;
+  return [
+    `for d in ${glob}; do`,
+    '  [ -d "$d" ] || continue;',
+    '  bin="$d/resources/native-binary/claude";',
+    '  real="$d/resources/native-binary/claude.real";',
+    '  [ -f "$real" ] || continue;',
+    `  if [ -f "$bin" ] && grep -q ${CLAUDE_SHIM_MARKER} "$bin" 2>/dev/null; then`,
+    '    rm -f "$bin"; mv "$real" "$bin"; chmod +x "$bin";',
+    '  fi;',
+    'done; true',
   ].join('\n');
 }
 

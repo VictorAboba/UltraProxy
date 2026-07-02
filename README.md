@@ -73,6 +73,11 @@ Auth falls through **agent → key → password → keyboard‑interactive**, so
 setups work. `ultraproxy.sshAuthMethod` just sets the preference. On Windows the OpenSSH agent pipe
 (`\\.\pipe\openssh-ssh-agent`) is used automatically.
 
+**Bastion / jump host.** Set `ultraproxy.sshProxyJump` (or per‑cluster `proxyJump`) to `[user@]host[:port]`
+to reach a cluster through a bastion, like `ssh -J`. UltraProxy connects to the bastion first and tunnels
+to the cluster through it, reusing the cluster's own credentials for the jump. (The tunnel is built inside
+`ssh2`, so this works without relying on your system `ssh`/`~/.ssh/config`.)
+
 ## Multiple clusters at once
 
 UltraProxy can proxy **several clusters simultaneously**: **one shared local Xray**, one reverse
@@ -107,8 +112,38 @@ tunnel per cluster. List them under `ultraproxy.clusters` (any field omitted fal
 |---|---|---|
 | `HTTPS_PROXY` / `NO_PROXY` (+ lowercase, `NODE_USE_ENV_PROXY=1`) | `~/.ultraproxy/env.sh`, sourced from `~/.bashrc` & `~/.profile` (guard line marked `# ULTRAPROXY`) | Claude Code CLI / SDKs |
 | `http.proxy`, `http.noProxy`, `terminal.integrated.env.linux` | `~/.vscode-server*/data/Machine/settings.json` (backed up to `*.ultraproxy.bak`) | GitHub Copilot & remote terminals |
+| Proxy env block (opt-in `injectServerEnv`) | `~/.vscode-server*/server-env-setup` (marker block) | The whole extension-host process tree (needs *Kill VS Code Server*) |
+| `claude` → shim + `claude.real` (opt-in `wrapClaudeCode`) | `~/.vscode-server*/extensions/anthropic.claude-code-*/resources/native-binary/` | Claude Code's native binary when spawned with a stripped env |
 
 All changes are **idempotent** and fully reverted by **UltraProxy: Remove Proxy from Remote**.
+
+### Reaching tools the terminal env misses (advanced, opt-in)
+
+The env/settings injection above covers shells, terminals, and extensions that honor `http.proxy`. Two
+extra channels close the remaining gaps — both **off by default**, both reverted on **Remove**:
+
+- **`ultraproxy.injectServerEnv`** — writes the proxy env into `~/.vscode-server/server-env-setup`, a
+  script VS Code Server sources at startup, so `HTTPS_PROXY` reaches the **extension-host process tree**
+  (subprocesses that extensions spawn, which terminal env does not cover). Apply it with **Remote-SSH:
+  Kill VS Code Server on Host** + reconnect.
+- **`ultraproxy.wrapClaudeCode`** — replaces the Claude Code extension's bundled native `claude` binary
+  with a shim that re-reads the live proxy URL from `~/.ultraproxy/proxy_url` and re-exports it before
+  `exec`ing the real binary (renamed `claude.real`). Covers the case where the extension host launches
+  `claude` with a stripped environment. Invasive (edits another extension's files) and **dropped when
+  Claude Code auto-updates** — re-run Apply after updating it. Linux/macOS clusters only.
+
+### Running injection through a container (`execProfile`)
+
+If your cluster work happens **inside a container** (VS Code Server and `$HOME` live in the container),
+set `ultraproxy.execProfile` (or per-cluster `execProfile`) so injection targets the container:
+
+- `docker` + `dockerContainer` — every remote command runs via `docker exec <container> bash -lc …`.
+- `custom` + `execTemplate` — a wrapper with a `{{CMD}}` placeholder, e.g. `sudo {{CMD}}` or
+  `srun --pty {{CMD}}`.
+
+> The reverse-tunnel port binds the SSH **host's** loopback, so `127.0.0.1:<port>` is reachable inside
+> the container only if it shares the host network (`--network host`, or Enroot/Pyxis, which do by
+> default). Otherwise map the port into the container.
 
 ## Commands
 

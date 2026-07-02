@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
 import { SshAuthMethod } from '../ssh/connect';
 
+/** How remote injection commands are executed on a cluster. */
+export type ExecProfile = 'direct' | 'docker' | 'custom';
+
 export interface UltraProxySettings {
   shareLink: string;
   subscriptionServerName: string;
@@ -23,6 +26,12 @@ export interface UltraProxySettings {
   xrayVersion: string;
   patchCopilotSettings: boolean;
   injectTerminalEnv: boolean;
+  injectServerEnv: boolean;
+  wrapClaudeCode: boolean;
+  sshProxyJump: string;
+  execProfile: ExecProfile;
+  dockerContainer: string;
+  execTemplate: string;
   autoStart: boolean;
   testEndpoints: string[];
   clusters: RawClusterConfig[];
@@ -41,6 +50,12 @@ export interface RawClusterConfig {
   vllmHost?: string[];
   patchCopilotSettings?: boolean;
   injectTerminalEnv?: boolean;
+  injectServerEnv?: boolean;
+  wrapClaudeCode?: boolean;
+  proxyJump?: string;
+  execProfile?: ExecProfile;
+  dockerContainer?: string;
+  execTemplate?: string;
 }
 
 /** A fully-resolved cluster (all defaults applied). */
@@ -56,6 +71,12 @@ export interface ClusterConfig {
   vllmHost: string[];
   patchCopilotSettings: boolean;
   injectTerminalEnv: boolean;
+  injectServerEnv: boolean;
+  wrapClaudeCode: boolean;
+  proxyJump?: string;
+  execProfile: ExecProfile;
+  dockerContainer: string;
+  execTemplate: string;
 }
 
 /**
@@ -107,6 +128,12 @@ export function readSettings(): UltraProxySettings {
     xrayVersion: c.get('xrayVersion', 'v26.3.27'),
     patchCopilotSettings: c.get('patchCopilotSettings', true),
     injectTerminalEnv: c.get('injectTerminalEnv', true),
+    injectServerEnv: c.get('injectServerEnv', false),
+    wrapClaudeCode: c.get('wrapClaudeCode', false),
+    sshProxyJump: c.get('sshProxyJump', ''),
+    execProfile: c.get('execProfile', 'direct') as ExecProfile,
+    dockerContainer: c.get('dockerContainer', ''),
+    execTemplate: c.get('execTemplate', ''),
     autoStart: c.get('autoStart', false),
     testEndpoints: c.get('testEndpoints', []),
     clusters: c.get('clusters', []),
@@ -166,6 +193,12 @@ export function getClusters(s: UltraProxySettings): ClusterConfig[] {
         vllmHost: c.vllmHost ?? [],
         patchCopilotSettings: c.patchCopilotSettings ?? s.patchCopilotSettings,
         injectTerminalEnv: c.injectTerminalEnv ?? s.injectTerminalEnv,
+        injectServerEnv: c.injectServerEnv ?? s.injectServerEnv,
+        wrapClaudeCode: c.wrapClaudeCode ?? s.wrapClaudeCode,
+        proxyJump: (c.proxyJump ?? s.sshProxyJump) || undefined,
+        execProfile: c.execProfile ?? s.execProfile,
+        dockerContainer: c.dockerContainer ?? s.dockerContainer,
+        execTemplate: c.execTemplate ?? s.execTemplate,
       }));
   }
   if (s.sshHost && s.sshUser) {
@@ -182,10 +215,77 @@ export function getClusters(s: UltraProxySettings): ClusterConfig[] {
         vllmHost: [],
         patchCopilotSettings: s.patchCopilotSettings,
         injectTerminalEnv: s.injectTerminalEnv,
+        injectServerEnv: s.injectServerEnv,
+        wrapClaudeCode: s.wrapClaudeCode,
+        proxyJump: s.sshProxyJump || undefined,
+        execProfile: s.execProfile,
+        dockerContainer: s.dockerContainer,
+        execTemplate: s.execTemplate,
       },
     ];
   }
   return [];
+}
+
+export interface JumpSpec {
+  host: string;
+  user: string;
+  port: number;
+}
+
+/**
+ * Parse a ProxyJump spec `[user@]host[:port]` (ssh -J form), filling user/port from the cluster's
+ * own credentials when omitted. IPv6 literals may be bracketed (`[::1]:2222`). Returns undefined
+ * for an empty/invalid spec (no host).
+ */
+export function parseJumpSpec(raw: string, defaultUser: string, defaultPort: number): JumpSpec | undefined {
+  let s = (raw || '').trim();
+  if (!s) {
+    return undefined;
+  }
+  if (s.includes('://')) {
+    s = s.slice(s.indexOf('://') + 3);
+  }
+  let user = defaultUser;
+  const at = s.lastIndexOf('@');
+  if (at >= 0) {
+    user = s.slice(0, at) || defaultUser;
+    s = s.slice(at + 1);
+  }
+  let host = s;
+  let port = defaultPort;
+  if (s.startsWith('[')) {
+    const close = s.indexOf(']');
+    if (close >= 0) {
+      host = s.slice(1, close);
+      const rest = s.slice(close + 1);
+      if (rest.startsWith(':')) {
+        const p = Number.parseInt(rest.slice(1), 10);
+        if (Number.isFinite(p) && p > 0) {
+          port = p;
+        }
+      }
+    } else {
+      // Unclosed bracket (typo): strip the leading '[' rather than keep a malformed literal.
+      host = s.slice(1);
+    }
+  } else {
+    // A single colon = host:port; multiple colons = a bare IPv6 literal (keep whole).
+    const colons = (s.match(/:/g) || []).length;
+    if (colons === 1) {
+      const i = s.indexOf(':');
+      host = s.slice(0, i);
+      const p = Number.parseInt(s.slice(i + 1), 10);
+      if (Number.isFinite(p) && p > 0) {
+        port = p;
+      }
+    }
+  }
+  host = host.trim();
+  if (!host) {
+    return undefined;
+  }
+  return { host, user, port: port || 22 };
 }
 
 /** Extract clean hostname(s) from a user-entered value that may include a scheme, path, or port. */

@@ -5,6 +5,11 @@ import { Logger } from '../util/logger';
 export interface TunnelOptions {
   connectConfig: ConnectConfig;
   keyboardPassword?: string;
+  /** Optional bastion (ssh -J): connect here first, then reach the target host through it. */
+  jump?: {
+    connectConfig: ConnectConfig;
+    keyboardPassword?: string;
+  };
   /** Remote bind address; 127.0.0.1 keeps the forwarded port loopback-only on the cluster. */
   remoteBindAddr: string;
   /** Requested remote port; 0 = auto-assign (recommended on shared clusters). */
@@ -30,8 +35,11 @@ const MAX_BACKOFF_MS = 30000;
  */
 export class SshTunnel {
   private client: Client | null = null;
+  private jumpClient: Client | null = null;
   private stopped = false;
   private everReady = false;
+  /** True while a main client is connected (used to decide if a bastion error must self-reschedule). */
+  private mainAlive = false;
   private backoff = 1000;
   private reconnectTimer?: NodeJS.Timeout;
 
@@ -55,6 +63,7 @@ export class SshTunnel {
     }
     const c = this.client;
     this.client = null;
+    this.endJump();
     if (!c) {
       return;
     }
@@ -70,12 +79,100 @@ export class SshTunnel {
     });
   }
 
+  /** Tear down the bastion connection (if any). Safe to call repeatedly. */
+  private endJump(): void {
+    const j = this.jumpClient;
+    this.jumpClient = null;
+    if (j) {
+      try {
+        j.end();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   /** The live client (valid only while connected); used to run remote injection commands. */
   get connection(): Client | null {
     return this.client;
   }
 
   private connect(): void {
+    if (this.stopped) {
+      return;
+    }
+    // Every (re)connect starts from a clean bastion so a dropped tunnel re-establishes the full chain.
+    this.endJump();
+    if (!this.opts.jump) {
+      this.startMainClient(this.opts.connectConfig);
+      return;
+    }
+
+    const jump = new Client();
+    this.jumpClient = jump;
+    const jumpPassword = this.opts.jump.keyboardPassword;
+    if (jumpPassword !== undefined) {
+      jump.on('keyboard-interactive', (_name, _instr, _lang, prompts, finish) => {
+        finish(prompts.map(() => jumpPassword ?? ''));
+      });
+    }
+    jump.on('ready', () => {
+      if (this.stopped) {
+        try {
+          jump.end();
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      const targetHost = String(this.opts.connectConfig.host ?? '');
+      const targetPort = this.opts.connectConfig.port ?? 22;
+      this.logger.info(`ProxyJump ready; forwarding to ${targetHost}:${targetPort}.`);
+      jump.forwardOut('127.0.0.1', 0, targetHost, targetPort, (err, stream) => {
+        if (this.stopped) {
+          return;
+        }
+        if (err || !stream) {
+          const e = err ?? new Error('ProxyJump forward returned no stream');
+          this.logger.error('ProxyJump forward failed', e);
+          try {
+            jump.end();
+          } catch {
+            /* ignore */
+          }
+          // Before first success: fatal. After: the main client isn't created here, so its 'close'
+          // won't fire — reschedule the whole chain ourselves.
+          if (!this.everReady) {
+            this.hooks.onFatal(new Error(`ProxyJump forward failed: ${e.message}`));
+          } else if (!this.stopped) {
+            this.scheduleReconnect();
+          }
+          return;
+        }
+        this.startMainClient({ ...this.opts.connectConfig, sock: stream });
+      });
+    });
+    jump.on('error', (e) => {
+      this.logger.warn(`ProxyJump SSH error: ${e.message}`);
+      if (this.stopped) {
+        return;
+      }
+      if (!this.everReady) {
+        this.hooks.onFatal(e);
+      } else if (!this.mainAlive) {
+        // Bastion dropped during a reconnect before a main client existed, so no main 'close' will
+        // fire to retry. When a main client IS alive, its own 'close' handles the reschedule.
+        this.scheduleReconnect();
+      }
+    });
+    try {
+      jump.connect(this.opts.jump.connectConfig);
+    } catch (e) {
+      this.hooks.onFatal(e as Error);
+    }
+  }
+
+  private startMainClient(config: ConnectConfig): void {
     if (this.stopped) {
       return;
     }
@@ -91,6 +188,7 @@ export class SshTunnel {
     client.on('ready', () => {
       this.logger.info('SSH connection ready.');
       this.everReady = true;
+      this.mainAlive = true;
       this.backoff = 1000;
       client.forwardIn(this.opts.remoteBindAddr, this.opts.remotePort, (err, boundPort) => {
         if (err) {
@@ -154,9 +252,11 @@ export class SshTunnel {
       }
     });
 
-    // 'close' is the single terminal event; reconnect only here to avoid multi-firing.
+    // 'close' is the terminal event for the main client.
     client.on('close', () => {
+      this.mainAlive = false;
       this.hooks.onDown();
+      this.endJump();
       if (this.stopped) {
         return;
       }
@@ -165,16 +265,30 @@ export class SshTunnel {
         this.logger.warn('Initial SSH connection failed; not reconnecting.');
         return;
       }
-      const delay = this.backoff;
-      this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);
-      this.logger.warn(`SSH closed; reconnecting in ${Math.round(delay / 1000)}s`);
-      this.reconnectTimer = setTimeout(() => this.connect(), delay);
+      this.scheduleReconnect();
     });
 
     try {
-      client.connect(this.opts.connectConfig);
+      client.connect(config);
     } catch (e) {
       this.hooks.onFatal(e as Error);
     }
+  }
+
+  /**
+   * Schedule a single backoff reconnect. Guarded so overlapping triggers (e.g. the bastion erroring
+   * AND the main client closing when the tunnel drops together) don't stack multiple timers.
+   */
+  private scheduleReconnect(): void {
+    if (this.stopped || this.reconnectTimer) {
+      return;
+    }
+    const delay = this.backoff;
+    this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);
+    this.logger.warn(`SSH closed; reconnecting in ${Math.round(delay / 1000)}s`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.connect();
+    }, delay);
   }
 }

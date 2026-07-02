@@ -1,5 +1,5 @@
 import { Client } from 'ssh2';
-import { exec } from '../ssh/exec';
+import { CmdWrap, exec } from '../ssh/exec';
 
 export interface RemoteInfo {
   home: string;
@@ -10,17 +10,17 @@ export interface RemoteInfo {
 }
 
 /** Probe the cluster for home dir, shell, python3, and VSCode server locations. */
-export async function detectRemote(client: Client): Promise<RemoteInfo> {
-  const home = (await exec(client, 'echo "$HOME"')).stdout.trim();
+export async function detectRemote(client: Client, wrap?: CmdWrap): Promise<RemoteInfo> {
+  const home = (await exec(client, 'echo "$HOME"', wrap)).stdout.trim();
   if (!home) {
     throw new Error('Could not determine remote $HOME');
   }
-  const shell = (await exec(client, 'echo "$SHELL"')).stdout.trim();
-  const hasPython3 = (await exec(client, 'command -v python3 >/dev/null 2>&1 && echo yes || echo no')).stdout.trim() === 'yes';
+  const shell = (await exec(client, 'echo "$SHELL"', wrap)).stdout.trim();
+  const hasPython3 = (await exec(client, 'command -v python3 >/dev/null 2>&1 && echo yes || echo no', wrap)).stdout.trim() === 'yes';
 
   const serverDirs: string[] = [];
   for (const d of ['.vscode-server', '.vscode-server-insiders']) {
-    const r = await exec(client, `[ -d "$HOME/${d}" ] && echo yes || echo no`);
+    const r = await exec(client, `[ -d "$HOME/${d}" ] && echo yes || echo no`, wrap);
     if (r.stdout.trim() === 'yes') {
       serverDirs.push(`${home}/${d}`);
     }

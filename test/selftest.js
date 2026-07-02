@@ -23,7 +23,16 @@ const {
   getClusters,
   resolveNoProxyForCluster,
   resolvedClusterName,
+  parseJumpSpec,
 } = require(path.join(OUT, 'config/settings'));
+const {
+  wrapExec,
+  renderServerEnvBlock,
+  cmdWriteServerEnv,
+  cmdRemoveServerEnv,
+  cmdWrapClaude,
+  cmdUnwrapClaude,
+} = require(path.join(OUT, 'remote/scripts'));
 const { extractModelIds } = require(path.join(OUT, 'util/probe'));
 
 let failures = 0;
@@ -81,6 +90,12 @@ const flatDefaults = {
   remoteProxyPort: 0,
   patchCopilotSettings: true,
   injectTerminalEnv: true,
+  injectServerEnv: false,
+  wrapClaudeCode: false,
+  sshProxyJump: '',
+  execProfile: 'direct',
+  dockerContainer: '',
+  execTemplate: '',
   sshHost: '',
   sshUser: '',
   noProxy: ['localhost'],
@@ -96,6 +111,40 @@ check('cluster noProxy merges vllm', cnp.includes('global.lan') && cnp.includes(
 const rawDup = [{ host: 'gpu1', user: 'a' }, { host: 'gpu1', user: 'b' }, { name: 'prod', host: 'x', user: 'a' }];
 check('resolvedClusterName dedups', resolvedClusterName(rawDup, 0) === 'gpu1' && resolvedClusterName(rawDup, 1) === 'gpu1-2' && resolvedClusterName(rawDup, 2) === 'prod');
 check('resolvedClusterName == getClusters names', getClusters({ ...flatDefaults, clusters: rawDup }).map((c) => c.name).join(',') === [0, 1, 2].map((i) => resolvedClusterName(rawDup, i)).join(','));
+
+// ---- borrowed features: exec profile + proxyJump on clusters ----
+const multi2 = getClusters({ ...flatDefaults, clusters: [{ host: 'c1', user: 'v', execProfile: 'docker', dockerContainer: 'box' }, { host: 'c2', user: 'v' }] });
+check('cluster execProfile override + default', multi2[0].execProfile === 'docker' && multi2[0].dockerContainer === 'box' && multi2[1].execProfile === 'direct');
+check('cluster proxyJump inherits flat default', getClusters({ ...flatDefaults, sshProxyJump: 'bastion', clusters: [{ host: 'c', user: 'v' }] })[0].proxyJump === 'bastion');
+check('cluster proxyJump per-cluster overrides', getClusters({ ...flatDefaults, sshProxyJump: 'bastion', clusters: [{ host: 'c', user: 'v', proxyJump: 'own.edu' }] })[0].proxyJump === 'own.edu');
+
+// ---- parseJumpSpec ----
+check('parseJumpSpec host only', (() => { const j = parseJumpSpec('bastion.edu', 'me', 22); return j && j.host === 'bastion.edu' && j.user === 'me' && j.port === 22; })());
+check('parseJumpSpec user@host:port', (() => { const j = parseJumpSpec('ju@bastion.edu:2222', 'me', 22); return j && j.host === 'bastion.edu' && j.user === 'ju' && j.port === 2222; })());
+check('parseJumpSpec ipv6 bracket', (() => { const j = parseJumpSpec('[2001:db8::1]:2200', 'me', 22); return j && j.host === '2001:db8::1' && j.port === 2200; })());
+check('parseJumpSpec bare ipv6 keeps host', (() => { const j = parseJumpSpec('2001:db8::1', 'me', 22); return j && j.host === '2001:db8::1' && j.port === 22; })());
+check('parseJumpSpec unclosed bracket strips [', (() => { const j = parseJumpSpec('[::1', 'me', 22); return j && j.host === '::1'; })());
+check('parseJumpSpec empty', parseJumpSpec('  ', 'me', 22) === undefined);
+
+// ---- exec wrapper ----
+check('wrapExec direct identity', wrapExec('echo hi', { profile: 'direct', dockerContainer: '', execTemplate: '' }) === 'echo hi');
+const dk = wrapExec("echo 'a'", { profile: 'docker', dockerContainer: 'ml', execTemplate: '' });
+check('wrapExec docker', dk.startsWith('docker exec ') && dk.includes("'ml'") && dk.includes('bash -lc'), dk);
+const ct = wrapExec('echo hi', { profile: 'custom', dockerContainer: '', execTemplate: 'sudo {{CMD}}' });
+check('wrapExec custom', ct.startsWith('sudo bash -lc ') && ct.includes("'echo hi'"), ct);
+check('wrapExec docker requires container', (() => { try { wrapExec('x', { profile: 'docker', dockerContainer: '', execTemplate: '' }); return false; } catch { return true; } })());
+check('wrapExec custom requires placeholder', (() => { try { wrapExec('x', { profile: 'custom', dockerContainer: '', execTemplate: 'sudo' }); return false; } catch { return true; } })());
+
+// ---- server-env-setup + claude wrap builders ----
+const seb = renderServerEnvBlock('http://127.0.0.1:1080', 'localhost,10.');
+check('renderServerEnvBlock', seb.includes('UltraProxy server-env BEGIN') && seb.includes('export HTTPS_PROXY="http://127.0.0.1:1080"') && seb.includes('UltraProxy server-env END'));
+const wcmd = cmdWriteServerEnv('/home/u/.vscode-server/server-env-setup', Buffer.from(seb).toString('base64'));
+check('cmdWriteServerEnv strips+appends', wcmd.includes('mkdir -p') && wcmd.includes('base64 -d') && wcmd.includes('server-env BEGIN'));
+check('cmdRemoveServerEnv strips block', cmdRemoveServerEnv('/x/server-env-setup').includes('server-env BEGIN'));
+const wc = cmdWrapClaude('/home/u/.vscode-server/extensions');
+check('cmdWrapClaude', wc.includes('anthropic.claude-code-*') && wc.includes('claude.real') && wc.includes('ultraproxy-claude-wrapper'));
+check('cmdWrapClaude base64 not heredoc (wrap-safe)', wc.includes('base64 -d') && !wc.includes('UPWRAP') && !wc.includes('<<'));
+check('cmdUnwrapClaude restores', cmdUnwrapClaude('/x/extensions').includes('mv "$real" "$bin"'));
 
 // ---- probe helper ----
 check('extractModelIds', (extractModelIds(JSON.stringify({ data: [{ id: 'claude-opus-4' }, { id: 'gpt-5' }] })) || []).length === 2);

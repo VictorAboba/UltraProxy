@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { Secrets } from '../config/secrets';
-import { getClusters, RawClusterConfig, readSettings, resolvedClusterName } from '../config/settings';
+import { ExecProfile, getClusters, RawClusterConfig, readSettings, resolvedClusterName } from '../config/settings';
 import { SshAuthMethod } from '../ssh/connect';
 
 type Item = vscode.QuickPickItem & { id: string };
@@ -235,6 +235,12 @@ export class ConfigUI {
         { label: `Remote proxy port: ${c.remoteProxyPort ?? '(auto)'}`, id: 'rport' },
         { label: `Patch Copilot settings: ${c.patchCopilotSettings ?? '(default on)'}`, id: 'patch' },
         { label: `Inject terminal env: ${c.injectTerminalEnv ?? '(default on)'}`, id: 'inject' },
+        { label: `Inject server-env: ${c.injectServerEnv ?? '(default)'}`, id: 'serverenv' },
+        { label: `Wrap Claude Code: ${c.wrapClaudeCode ?? '(default)'}`, id: 'claudewrap' },
+        { label: `ProxyJump (bastion): ${c.proxyJump ?? '(none)'}`, id: 'jump' },
+        { label: `Exec profile: ${c.execProfile ?? '(default)'}`, id: 'execprofile' },
+        { label: `Docker container: ${c.dockerContainer ?? '(none)'}`, id: 'dockercontainer' },
+        { label: `Exec template: ${c.execTemplate ?? '(none)'}`, id: 'exectemplate' },
         { label: '$(key) Set SSH password / passphrase', id: 'secret' },
         { label: '$(trash) Remove this cluster', id: 'remove' },
         { label: '$(arrow-left) Back', id: 'back' },
@@ -349,9 +355,61 @@ export class ConfigUI {
       case 'inject':
         c.injectTerminalEnv = !(c.injectTerminalEnv ?? true);
         return true;
+      case 'serverenv':
+        // Cycle default(inherit) -> on -> off -> default so inheritance stays reachable.
+        c.injectServerEnv = cycleTri(c.injectServerEnv);
+        return true;
+      case 'claudewrap':
+        c.wrapClaudeCode = cycleTri(c.wrapClaudeCode);
+        return true;
+      case 'jump': {
+        const v = await askText('ProxyJump bastion — [user@]host[:port] (blank = none)', c.proxyJump ?? '');
+        if (v === undefined) {
+          return false;
+        }
+        c.proxyJump = v.trim() || undefined;
+        return true;
+      }
+      case 'execprofile': {
+        const p = await this.pickExecProfile();
+        if (p === undefined || p === '') {
+          return false; // cancelled or "keep current" — leave the field untouched
+        }
+        c.execProfile = p as ExecProfile;
+        return true;
+      }
+      case 'dockercontainer': {
+        const v = await askText('Docker container name/ID (used when exec profile is docker)', c.dockerContainer ?? '');
+        if (v === undefined) {
+          return false;
+        }
+        c.dockerContainer = v.trim() || undefined;
+        return true;
+      }
+      case 'exectemplate': {
+        const v = await askText('Custom exec template with {{CMD}} (e.g. sudo {{CMD}})', c.execTemplate ?? '');
+        if (v === undefined) {
+          return false;
+        }
+        c.execTemplate = v.trim() || undefined;
+        return true;
+      }
       default:
         return false;
     }
+  }
+
+  private async pickExecProfile(): Promise<ExecProfile | '' | undefined> {
+    const id = await menu('Exec profile', [
+      { label: 'direct', description: 'run on the SSH host (default)', id: 'direct' },
+      { label: 'docker', description: 'docker exec into a container', id: 'docker' },
+      { label: 'custom', description: 'custom {{CMD}} wrapper', id: 'custom' },
+      { label: '(keep current / default)', id: '' },
+    ]);
+    if (id === undefined) {
+      return undefined;
+    }
+    return id as ExecProfile | '';
   }
 
   private async setClusterSecret(clusterName: string): Promise<void> {
@@ -457,6 +515,10 @@ export class ConfigUI {
         { label: `$(rocket) Auto-start on launch: ${onOff(s.autoStart)}`, id: 'autoStart' },
         { label: `$(comment-discussion) Patch Copilot settings (default): ${onOff(s.patchCopilotSettings)}`, id: 'patchCopilotSettings' },
         { label: `$(terminal) Inject terminal env (default): ${onOff(s.injectTerminalEnv)}`, id: 'injectTerminalEnv' },
+        { label: `$(server-environment) Inject server-env (default): ${onOff(s.injectServerEnv)}`, description: 'reaches the ext-host process tree; needs Kill VS Code Server', id: 'injectServerEnv' },
+        { label: `$(robot) Wrap Claude Code (default): ${onOff(s.wrapClaudeCode)}`, description: 'shim the bundled claude binary', id: 'wrapClaudeCode' },
+        { label: `$(git-merge) ProxyJump (default): ${s.sshProxyJump || '(none)'}`, description: 'bastion for the flat single-cluster', id: 'sshProxyJump' },
+        { label: `$(vm) Exec profile (default): ${s.execProfile}`, description: 'direct / docker / custom', id: 'execProfile' },
         { label: `$(verified) Allow unverified xray binary: ${onOff(s.allowUnverifiedBinary)}`, id: 'allowUnverifiedBinary' },
         { label: `$(file-binary) Xray path: ${s.xrayPath || '(auto-download)'}`, id: 'xrayPath' },
         { label: `$(tag) Xray version: ${s.xrayVersion}`, id: 'xrayVersion' },
@@ -481,6 +543,47 @@ export class ConfigUI {
         return setVal('patchCopilotSettings', !s.patchCopilotSettings);
       case 'injectTerminalEnv':
         return setVal('injectTerminalEnv', !s.injectTerminalEnv);
+      case 'injectServerEnv':
+        return setVal('injectServerEnv', !s.injectServerEnv);
+      case 'wrapClaudeCode':
+        return setVal('wrapClaudeCode', !s.wrapClaudeCode);
+      case 'sshProxyJump': {
+        const v = await askText('Default ProxyJump bastion — [user@]host[:port] (blank = none)', s.sshProxyJump);
+        if (v !== undefined) {
+          await setVal('sshProxyJump', v.trim());
+        }
+        return;
+      }
+      case 'execProfile': {
+        const p = await this.pickExecProfile();
+        if (p === undefined || p === '') {
+          return;
+        }
+        // Capture the dependent value BEFORE committing the profile, so cancelling (or leaving it
+        // blank) writes nothing and can't leave e.g. execProfile=docker with no container.
+        if (p === 'docker') {
+          const c = await askText('Docker container name/ID', s.dockerContainer, { required: true });
+          if (c === undefined || !c.trim()) {
+            return;
+          }
+          await setVal('dockerContainer', c.trim());
+          await setVal('execProfile', 'docker');
+        } else if (p === 'custom') {
+          const t = await askText('Custom exec template with {{CMD}} (e.g. sudo {{CMD}})', s.execTemplate, { required: true });
+          if (t === undefined || !t.trim()) {
+            return;
+          }
+          if (!t.includes('{{CMD}}')) {
+            vscode.window.showWarningMessage('UltraProxy: exec template must contain {{CMD}} — not saved.');
+            return;
+          }
+          await setVal('execTemplate', t.trim());
+          await setVal('execProfile', 'custom');
+        } else {
+          await setVal('execProfile', p);
+        }
+        return;
+      }
       case 'allowUnverifiedBinary':
         return setVal('allowUnverifiedBinary', !s.allowUnverifiedBinary);
       case 'testEndpoints':
@@ -560,4 +663,9 @@ function splitList(v: string): string[] {
     .split(/[,\n]/)
     .map((x) => x.trim())
     .filter(Boolean);
+}
+
+/** Cycle an optional per-cluster boolean: undefined (inherit default) -> true -> false -> undefined. */
+function cycleTri(v: boolean | undefined): boolean | undefined {
+  return v === undefined ? true : v === true ? false : undefined;
 }

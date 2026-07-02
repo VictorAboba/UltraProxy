@@ -2,7 +2,7 @@
   "name": "ultraproxy",
   "displayName": "UltraProxy",
   "description": "Route Anthropic/OpenAI traffic from a Remote-SSH cluster through a local Xray (ss/ssconf/vless) proxy over a reverse SSH tunnel. Keeps local-network (vLLM) traffic direct.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "icon": "media/icon.png",
   "publisher": "ultraproxy",
   "license": "MIT",
@@ -231,6 +231,35 @@
               "injectTerminalEnv": {
                 "type": "boolean",
                 "description": "Inject terminal env on this cluster."
+              },
+              "injectServerEnv": {
+                "type": "boolean",
+                "description": "Write the proxy env into ~/.vscode-server/server-env-setup on this cluster (reaches the extension-host process tree)."
+              },
+              "wrapClaudeCode": {
+                "type": "boolean",
+                "description": "Wrap the Claude Code bundled 'claude' binary on this cluster so it inherits the proxy env."
+              },
+              "proxyJump": {
+                "type": "string",
+                "description": "Bastion/jump host for this cluster ([user@]host[:port]), like ssh -J. Uses the same credentials as the cluster."
+              },
+              "execProfile": {
+                "type": "string",
+                "enum": [
+                  "direct",
+                  "docker",
+                  "custom"
+                ],
+                "description": "How remote commands run on this cluster: direct, inside a docker container, or via a custom wrapper."
+              },
+              "dockerContainer": {
+                "type": "string",
+                "description": "Docker container name/ID to exec into (when execProfile is 'docker')."
+              },
+              "execTemplate": {
+                "type": "string",
+                "description": "Custom command wrapper with a {{CMD}} placeholder (when execProfile is 'custom'), e.g. 'sudo {{CMD}}'."
               }
             }
           }
@@ -322,6 +351,47 @@
           "default": true,
           "scope": "application",
           "description": "Also write terminal.integrated.env.linux so integrated-terminal tools (Claude Code CLI, SDKs) inherit the proxy env."
+        },
+        "ultraproxy.injectServerEnv": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Write the proxy env into `~/.vscode-server/server-env-setup` (a script VS Code Server sources on startup) so `HTTPS_PROXY` reaches the **extension-host process tree** — i.e. subprocesses that extensions spawn (including the Claude Code extension), which the terminal-only env does not cover. Off by default; **requires _Remote-SSH: Kill VS Code Server on Host_ + reconnect to take effect**. Fully reverted on Remove."
+        },
+        "ultraproxy.wrapClaudeCode": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Wrap the Anthropic Claude Code extension's bundled native `claude` binary on the cluster with a shim that re-exports the proxy env before exec'ing the real binary, so it traverses the tunnel even when the extension host spawns it with a stripped environment. Invasive (edits another extension's files) and reverted on Remove; Linux/macOS clusters only. **Note:** a Claude Code auto-update replaces the binary and drops the wrap — re-run Apply after updating it."
+        },
+        "ultraproxy.sshProxyJump": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Default bastion/jump host for single-cluster mode, in `[user@]host[:port]` form (equivalent to `ssh -J`). The tunnel first connects to this host, then forwards to the cluster through it. The jump uses the **same** credentials (agent/key/password) as the cluster. Per-cluster `clusters[].proxyJump` overrides this."
+        },
+        "ultraproxy.execProfile": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "docker",
+            "custom"
+          ],
+          "default": "direct",
+          "scope": "application",
+          "markdownDescription": "How remote injection commands run on the cluster. `direct` runs them on the SSH host (default). `docker` wraps each in `docker exec -i <container> …` so injection targets a container's `$HOME`/`.vscode-server`. `custom` uses `execTemplate`. **Note (docker/custom):** the reverse-tunnel port binds the SSH host's loopback, so the container must share the host network (e.g. `--network host`, or Enroot/Pyxis which do by default) for `127.0.0.1:<port>` to be reachable inside it."
+        },
+        "ultraproxy.dockerContainer": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Docker container name or ID to exec into when execProfile is 'docker'."
+        },
+        "ultraproxy.execTemplate": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Custom remote-command wrapper used when `execProfile` is `custom`. Must contain a `{{CMD}}` placeholder, e.g. `sudo {{CMD}}` or `srun --pty {{CMD}}`."
         },
         "ultraproxy.autoStart": {
           "type": "boolean",

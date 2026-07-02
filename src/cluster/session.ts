@@ -1,10 +1,11 @@
 import { Client } from 'ssh2';
 import { Secrets } from '../config/secrets';
-import { ClusterConfig } from '../config/settings';
+import { ClusterConfig, parseJumpSpec } from '../config/settings';
 import { detectRemote, RemoteInfo } from '../remote/detect';
 import { applyInjection, InjectResult, removeInjection } from '../remote/injector';
+import { RemoteExecProfile, wrapExec } from '../remote/scripts';
 import { makeConnectConfig, SshAuth } from '../ssh/connect';
-import { exec } from '../ssh/exec';
+import { CmdWrap, exec } from '../ssh/exec';
 import { SshTunnel } from '../ssh/tunnel';
 import { Logger } from '../util/logger';
 import { extractModelIds, probeViaHttpProxy } from '../util/probe';
@@ -120,6 +121,16 @@ export class ClusterSession {
     return `[${this.cfg.name}]`;
   }
 
+  /** A per-command wrapper reflecting this cluster's exec profile (direct / docker / custom). */
+  private execWrap(): CmdWrap {
+    const p: RemoteExecProfile = {
+      profile: this.cfg.execProfile,
+      dockerContainer: this.cfg.dockerContainer,
+      execTemplate: this.cfg.execTemplate,
+    };
+    return (cmd) => wrapExec(cmd, p);
+  }
+
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.opQueue.then(fn, fn);
     this.opQueue = run.then(
@@ -198,6 +209,17 @@ export class ClusterSession {
     };
     const { config: connectConfig, keyboardPassword } = makeConnectConfig(auth);
 
+    // ProxyJump: build a bastion connection reusing the cluster's own credentials. The bastion's own
+    // port defaults to 22 (like `ssh -J`), independent of the cluster's SSH port, unless the spec
+    // carries an explicit :port.
+    let jump: { connectConfig: typeof connectConfig; keyboardPassword?: string } | undefined;
+    const jumpSpec = this.cfg.proxyJump ? parseJumpSpec(this.cfg.proxyJump, this.cfg.user, 22) : undefined;
+    if (jumpSpec) {
+      const built = makeConnectConfig({ ...auth, host: jumpSpec.host, username: jumpSpec.user, port: jumpSpec.port });
+      jump = { connectConfig: built.config, keyboardPassword: built.keyboardPassword };
+      this.logger.info(`${this.tag()} using ProxyJump ${jumpSpec.user}@${jumpSpec.host}:${jumpSpec.port}`);
+    }
+
     return new Promise<void>((resolve, reject) => {
       let firstSettled = false;
       let firstTimer: NodeJS.Timeout | undefined;
@@ -234,6 +256,7 @@ export class ClusterSession {
         {
           connectConfig,
           keyboardPassword,
+          jump,
           remoteBindAddr: '127.0.0.1',
           remotePort: this.cfg.remoteProxyPort,
           localPort: this.localHttpPort,
@@ -245,9 +268,10 @@ export class ClusterSession {
               return;
             }
             try {
+              const wrap = this.execWrap();
               this.boundPort = boundPort;
               if (!this.remoteInfo) {
-                this.remoteInfo = await detectRemote(client);
+                this.remoteInfo = await detectRemote(client, wrap);
                 this.logger.info(
                   `${this.tag()} remote home=${this.remoteInfo.home} python3=${this.remoteInfo.hasPython3} servers=[${this.remoteInfo.serverDirs.join(', ')}]`,
                 );
@@ -261,8 +285,11 @@ export class ClusterSession {
                   noProxy: params.noProxy,
                   patchSettings: this.cfg.patchCopilotSettings,
                   injectTerminal: this.cfg.injectTerminalEnv,
+                  injectServerEnv: this.cfg.injectServerEnv,
+                  wrapClaudeCode: this.cfg.wrapClaudeCode,
                 },
                 this.logger,
+                wrap,
               );
               if (gen !== this.generation) {
                 return;
@@ -315,8 +342,11 @@ export class ClusterSession {
     }
     if (isFirst) {
       this.logger.info(`${this.tag()} proxy ready at ${proxyUrl}`);
+      const extra = res.serverEnvWritten
+        ? ' For extension-host tools, also run "Remote-SSH: Kill VS Code Server on Host" and reconnect.'
+        : '';
       this.hooks.onNotice(
-        `Cluster "${this.cfg.name}" ready (${proxyUrl}). Reload that cluster's VSCode window and open a new terminal so tools pick up the proxy.`,
+        `Cluster "${this.cfg.name}" ready (${proxyUrl}). Reload that cluster's VSCode window and open a new terminal so tools pick up the proxy.${extra}`,
         { reload: true },
       );
     } else if (portChanged) {
@@ -346,7 +376,7 @@ export class ClusterSession {
   private async teardown(removeRemote: boolean): Promise<void> {
     if (removeRemote && this.tunnel?.connection && this.remoteInfo) {
       try {
-        await removeInjection(this.tunnel.connection, this.remoteInfo, this.cfg.patchCopilotSettings, this.logger);
+        await removeInjection(this.tunnel.connection, this.remoteInfo, this.cfg.patchCopilotSettings, this.logger, this.execWrap());
       } catch (e) {
         this.logger.warn(`${this.tag()} remote cleanup failed: ${(e as Error).message}`);
       }
@@ -380,7 +410,7 @@ export class ClusterSession {
     const out: ProviderTest[] = [];
     for (const t of targets) {
       const local = await probeViaHttpProxy(params.localHttpPort, t.url, t.headers);
-      const remoteCode = await remoteHttpCode(client, proxyUrl, t.url);
+      const remoteCode = await remoteHttpCode(client, proxyUrl, t.url, this.execWrap());
 
       const localOk = local.ok && isReachable(local.status);
       const remoteOk = isReachable(Number.parseInt(remoteCode, 10));
@@ -435,13 +465,13 @@ function buildTestTargets(extra: string[], anthKey: string | undefined, oaiKey: 
   return targets;
 }
 
-async function remoteHttpCode(client: Client, proxyUrl: string, url: string): Promise<string> {
+async function remoteHttpCode(client: Client, proxyUrl: string, url: string, wrap?: CmdWrap): Promise<string> {
   const cmd =
     `if command -v curl >/dev/null 2>&1; then ` +
     `curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -x ${shq(proxyUrl)} ${shq(url)} 2>/dev/null || echo 000; ` +
     `else echo NOCURL; fi`;
   try {
-    const r = await exec(client, cmd);
+    const r = await exec(client, cmd, wrap);
     return r.stdout.trim() || '000';
   } catch {
     return '000';
