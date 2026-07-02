@@ -1,0 +1,11 @@
+node_modules/
+out/
+dist/
+*.vsix
+.vscode-test/
+*.log
+.DS_Store
+
+# Downloaded xray binaries / caches (never commit)
+bin/
+.xray-cache/

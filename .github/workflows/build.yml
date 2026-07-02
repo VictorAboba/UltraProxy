@@ -1,0 +1,63 @@
+name: Build VSIX
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # allow creating a Release when a v* tag is pushed
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Test
+        run: npm test
+
+      # Bundle the Xray binaries INTO the .vsix so the installed extension fetches nothing at runtime.
+      # Self-contained for win32-x64 / linux-x64; other platforms fall back to a one-time runtime
+      # download (add them to XRAY_TARGETS to bundle those too).
+      - name: Bundle Xray binaries
+        run: npm run download-xray
+        env:
+          XRAY_TARGETS: win32-x64,linux-x64
+
+      - name: Package VSIX
+        run: npx vsce package --allow-missing-repository -o ultraproxy.vsix
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultraproxy-vsix
+          path: ultraproxy.vsix
+          if-no-files-found: error
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          PKG="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$PKG" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG"; exit 1
+          fi
+
+      - name: Create Release (on v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ultraproxy.vsix

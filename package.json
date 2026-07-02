@@ -1,0 +1,355 @@
+{
+  "name": "ultraproxy",
+  "displayName": "UltraProxy",
+  "description": "Route Anthropic/OpenAI traffic from a Remote-SSH cluster through a local Xray (ss/ssconf/vless) proxy over a reverse SSH tunnel. Keeps local-network (vLLM) traffic direct.",
+  "version": "0.1.0",
+  "publisher": "ultraproxy",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "proxy",
+    "xray",
+    "shadowsocks",
+    "vless",
+    "remote-ssh",
+    "anthropic",
+    "openai"
+  ],
+  "main": "./out/extension.js",
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": false
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "ultraproxy.configure",
+        "title": "Configure (all settings)",
+        "category": "UltraProxy"
+      },
+      {
+        "command": "ultraproxy.apply",
+        "title": "Apply Proxy to Remote",
+        "category": "UltraProxy"
+      },
+      {
+        "command": "ultraproxy.remove",
+        "title": "Remove Proxy from Remote",
+        "category": "UltraProxy"
+      },
+      {
+        "command": "ultraproxy.restart",
+        "title": "Restart Proxy & Tunnel",
+        "category": "UltraProxy"
+      },
+      {
+        "command": "ultraproxy.setSecrets",
+        "title": "Set SSH / Proxy Credentials",
+        "category": "UltraProxy"
+      },
+      {
+        "command": "ultraproxy.pickServer",
+        "title": "Pick Server from Subscription",
+        "category": "UltraProxy"
+      },
+      {
+        "command": "ultraproxy.testConnection",
+        "title": "Test Connection (list provider models)",
+        "category": "UltraProxy"
+      },
+      {
+        "command": "ultraproxy.showLog",
+        "title": "Show Log",
+        "category": "UltraProxy"
+      },
+      {
+        "command": "ultraproxy.status",
+        "title": "Show Status",
+        "category": "UltraProxy"
+      }
+    ],
+    "configuration": {
+      "title": "UltraProxy",
+      "properties": {
+        "ultraproxy.shareLink": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Proxy share link: `ss://`, `ssconf://`, `vless://`, or an `http(s)://` subscription URL. For secrecy you can leave this empty and store it via **UltraProxy: Set SSH / Proxy Credentials** instead."
+        },
+        "ultraproxy.subscriptionServerName": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "When the share link is a SIP008/subscription with multiple servers, pick the one whose remark/id matches this. Empty = first server."
+        },
+        "ultraproxy.whitelistExtras": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "application",
+          "markdownDescription": "Extra destinations that should egress through the proxy (everything else is blocked). Bare hostnames become `domain:<host>`; `domain:`, `full:`, `regexp:`, `geosite:`, `geoip:` prefixes pass through verbatim."
+        },
+        "ultraproxy.vllmHost": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "application",
+          "markdownDescription": "Usually **not needed**: vLLM on a private LAN IP (10.x / 172.16-31.x / 192.168.x / localhost) is already excluded by the default `NO_PROXY`, and non-whitelisted traffic goes direct anyway. Only add a host here if your vLLM is reached by a **hostname** that resolves to a private IP (NO_PROXY matches by name, not resolved IP), or if you enabled `strictWhitelist`."
+        },
+        "ultraproxy.noProxy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "fc00::/7",
+            "pypi.org",
+            ".pythonhosted.org",
+            "huggingface.co",
+            ".hf.co",
+            "cdn-lfs.huggingface.co",
+            "conda.anaconda.org",
+            ".anaconda.com",
+            "registry-1.docker.io",
+            ".docker.io"
+          ],
+          "scope": "application",
+          "markdownDescription": "Hosts kept OFF the proxy (the cluster reaches them on its own internet). Includes localhost, private ranges, and common package/registry hosts so big `pip`/`hf`/`conda` downloads don't tunnel through your local machine. `vllmHost` entries are merged in automatically."
+        },
+        "ultraproxy.strictWhitelist": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "When **off** (default), traffic that is not on the proxy whitelist is sent `direct` via your local machine, so nothing on the cluster breaks. When **on**, non-whitelisted traffic is **blocked** (strict isolation) — may break `pip`/`git`/etc. run from a proxied shell unless added to `noProxy`."
+        },
+        "ultraproxy.allowInsecureTls": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "Honor allowInsecure=1 from the share link (disables proxy-server TLS certificate verification). Off by default so a fetched subscription cannot silently downgrade TLS."
+        },
+        "ultraproxy.allowUnverifiedBinary": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "Allow running a downloaded Xray binary whose SHA-256 could not be verified against the release .dgst. Off by default (fail closed)."
+        },
+        "ultraproxy.clusters": {
+          "type": "array",
+          "default": [],
+          "scope": "application",
+          "markdownDescription": "Multiple clusters to proxy **simultaneously** (one shared local Xray, one reverse tunnel each). When empty, the flat `sshHost`/`sshUser`/… below act as a single cluster. Store each cluster's SSH password/passphrase via **Set Credentials**.",
+          "items": {
+            "type": "object",
+            "required": [
+              "host",
+              "user"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Unique display name (defaults to host)."
+              },
+              "host": {
+                "type": "string",
+                "description": "SSH host."
+              },
+              "user": {
+                "type": "string",
+                "description": "SSH username."
+              },
+              "port": {
+                "type": "number",
+                "description": "SSH port (default: ultraproxy.sshPort)."
+              },
+              "authMethod": {
+                "type": "string",
+                "enum": [
+                  "agent",
+                  "key",
+                  "password"
+                ],
+                "description": "Preferred auth (default: ultraproxy.sshAuthMethod)."
+              },
+              "privateKeyPath": {
+                "type": "string",
+                "description": "Private key path for this cluster."
+              },
+              "agentPath": {
+                "type": "string",
+                "description": "SSH agent socket/pipe override."
+              },
+              "remoteProxyPort": {
+                "type": "number",
+                "description": "Cluster loopback port (0 = auto)."
+              },
+              "vllmHost": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extra local-network hosts to keep off the proxy for THIS cluster."
+              },
+              "patchCopilotSettings": {
+                "type": "boolean",
+                "description": "Patch remote VSCode http.proxy on this cluster."
+              },
+              "injectTerminalEnv": {
+                "type": "boolean",
+                "description": "Inject terminal env on this cluster."
+              }
+            }
+          }
+        },
+        "ultraproxy.sshHost": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Single-cluster fallback SSH host (used when ultraproxy.clusters is empty)."
+        },
+        "ultraproxy.sshUser": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Cluster SSH username."
+        },
+        "ultraproxy.sshPort": {
+          "type": "number",
+          "default": 22,
+          "scope": "application",
+          "description": "Cluster SSH port."
+        },
+        "ultraproxy.sshAuthMethod": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "key",
+            "password"
+          ],
+          "enumDescriptions": [
+            "Use the running SSH agent (OpenSSH agent / Pageant).",
+            "Use a private key file (path below).",
+            "Use a password (stored securely via Set Credentials)."
+          ],
+          "default": "agent",
+          "scope": "application",
+          "description": "Preferred SSH auth method. UltraProxy still falls back through agent -> key -> password -> keyboard-interactive."
+        },
+        "ultraproxy.sshPrivateKeyPath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Path to an OpenSSH/PEM private key file (read locally). Passphrase, if any, is stored via Set Credentials."
+        },
+        "ultraproxy.sshAgentPath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Override SSH agent socket/pipe. Empty = auto (\\\\.\\pipe\\openssh-ssh-agent on Windows, $SSH_AUTH_SOCK elsewhere)."
+        },
+        "ultraproxy.remoteProxyPort": {
+          "type": "number",
+          "default": 0,
+          "scope": "application",
+          "description": "Cluster loopback port the reverse tunnel binds to. 0 = auto-assign (recommended on shared clusters)."
+        },
+        "ultraproxy.localSocksPort": {
+          "type": "number",
+          "default": 0,
+          "scope": "application",
+          "description": "Local SOCKS5 port for Xray. 0 = auto free port."
+        },
+        "ultraproxy.localHttpPort": {
+          "type": "number",
+          "default": 0,
+          "scope": "application",
+          "description": "Local HTTP proxy port for Xray (this is what the tunnel targets). 0 = auto free port."
+        },
+        "ultraproxy.xrayPath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Path to an existing xray/xray.exe binary, or a v2rayN install root (bin/xray/xray.exe is probed). Empty = download the pinned version on first run."
+        },
+        "ultraproxy.xrayVersion": {
+          "type": "string",
+          "default": "v26.3.27",
+          "scope": "application",
+          "description": "Pinned XTLS/Xray-core release tag (CalVer, e.g. v26.3.27)."
+        },
+        "ultraproxy.patchCopilotSettings": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Write http.proxy/http.noProxy into the remote VSCode Machine settings so GitHub Copilot and other extensions use the tunnel. Requires python3 on the cluster."
+        },
+        "ultraproxy.injectTerminalEnv": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Also write terminal.integrated.env.linux so integrated-terminal tools (Claude Code CLI, SDKs) inherit the proxy env."
+        },
+        "ultraproxy.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "Automatically apply the proxy when VSCode starts."
+        },
+        "ultraproxy.testEndpoints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "application",
+          "markdownDescription": "Extra HTTPS URLs to probe in **Test Connection** (in addition to the Anthropic/OpenAI `/v1/models` endpoints). Reachability only — no model listing."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "node test/selftest.js",
+    "download-xray": "node scripts/download-xray.mjs",
+    "package": "npm run compile && npm run download-xray && vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "ssh2": "^1.16.0",
+    "yauzl": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ssh2": "^1.15.1",
+    "@types/vscode": "^1.85.0",
+    "@types/yauzl": "^2.10.3",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^5.5.4"
+  }
+}
