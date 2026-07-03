@@ -45,6 +45,35 @@ async function askNumber(prompt: string, value: number): Promise<number | undefi
   return v.trim() === '' ? 0 : Number.parseInt(v.trim(), 10);
 }
 
+/**
+ * Ask for an OPTIONAL number: blank clears the field (inherit the global default), a value sets it.
+ * Returns undefined on cancel, otherwise { value } where value === undefined means "inherit".
+ * Needed for fields like remoteProxyPort where 0 is itself meaningful (auto) and must stay
+ * distinguishable from "not set" — an explicit 0 would silently shadow a global fixed port.
+ */
+async function askOptionalNumber(prompt: string, current: number | undefined): Promise<{ value?: number } | undefined> {
+  const v = await vscode.window.showInputBox({
+    prompt,
+    value: current !== undefined ? String(current) : '',
+    ignoreFocusOut: true,
+    validateInput: (x) => (x.trim() === '' || /^\d+$/.test(x.trim()) ? undefined : 'Whole number, or blank to inherit'),
+  });
+  if (v === undefined) {
+    return undefined;
+  }
+  const t = v.trim();
+  return { value: t === '' ? undefined : Number.parseInt(t, 10) };
+}
+
+/** Menu label for a cluster's remoteProxyPort: inherit (with the resolved global) / auto / fixed. */
+function describeRemotePort(v: number | undefined): string {
+  if (v === undefined) {
+    const g = readSettings().remoteProxyPort;
+    return g ? `(inherit: ${g})` : '(inherit: auto)';
+  }
+  return v === 0 ? '0 (auto — overrides global)' : String(v);
+}
+
 async function confirm(message: string): Promise<boolean> {
   const c = await vscode.window.showWarningMessage(message, { modal: true }, 'Yes');
   return c === 'Yes';
@@ -232,7 +261,7 @@ export class ConfigUI {
         { label: `Private key path: ${c.privateKeyPath ?? '(none)'}`, id: 'key' },
         { label: `SSH agent path: ${c.agentPath ?? '(auto)'}`, id: 'agentpath' },
         { label: `vLLM hosts: ${(c.vllmHost ?? []).join(', ') || '(none)'}`, id: 'vllm' },
-        { label: `Remote proxy port: ${c.remoteProxyPort ?? '(auto)'}`, id: 'rport' },
+        { label: `Remote proxy port: ${describeRemotePort(c.remoteProxyPort)}`, id: 'rport' },
         { label: `Patch Copilot settings: ${c.patchCopilotSettings ?? '(default on)'}`, id: 'patch' },
         { label: `Inject terminal env: ${c.injectTerminalEnv ?? '(default on)'}`, id: 'inject' },
         { label: `Inject server-env: ${c.injectServerEnv ?? '(default)'}`, id: 'serverenv' },
@@ -342,11 +371,15 @@ export class ConfigUI {
         return true;
       }
       case 'rport': {
-        const v = await askNumber('Remote proxy port (0 = auto-assign)', c.remoteProxyPort ?? 0);
-        if (v === undefined) {
+        const g = readSettings().remoteProxyPort;
+        const r = await askOptionalNumber(
+          `Remote proxy port — fixed number, 0 = auto, blank = inherit global (${g || 'auto'})`,
+          c.remoteProxyPort,
+        );
+        if (r === undefined) {
           return false;
         }
-        c.remoteProxyPort = v;
+        c.remoteProxyPort = r.value;
         return true;
       }
       case 'patch':

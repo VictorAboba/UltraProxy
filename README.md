@@ -192,7 +192,12 @@ locally** and is never sent to the cluster. Add extra probe URLs with `ultraprox
   the belt‑and‑suspenders for terminal tools.
 - With `remoteProxyPort: 0` (default) the cluster port is **auto‑assigned and changes on reconnect**;
   already‑open terminals keep the old value. On a port change after reconnect UltraProxy re‑prompts
-  you to reload. Set a fixed `remoteProxyPort` for stability.
+  you to reload. Set a fixed `remoteProxyPort` for stability — **required** in practice with
+  `injectServerEnv` (the `server-env-setup` file is only sourced when the VS Code Server starts, so
+  an auto port goes stale on the first reconnect).
+- **Inheritance gotcha:** a cluster entry with an explicit `"remoteProxyPort": 0` **overrides** a
+  global fixed `ultraproxy.remoteProxyPort` (it means "force auto for this cluster"). To inherit the
+  global port, **omit** the field on the cluster (in the Clusters UI: leave the input blank).
 - **Non‑AI traffic from a proxied shell:** because `HTTPS_PROXY` is exported globally, a host not in
   the whitelist and not in `NO_PROXY` is tunnelled through your local machine (works, but uses your
   home bandwidth). The default `NO_PROXY` covers PyPI/HuggingFace/conda/Docker/private ranges; add

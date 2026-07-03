@@ -158,6 +158,14 @@ export class Orchestrator {
       this.refreshStatus();
       return;
     }
+    // server-env-setup is only sourced when the VS Code Server STARTS, so with an auto-assigned
+    // port the env it exports goes stale as soon as the tunnel reconnects on a new port.
+    if (cfg.injectServerEnv && cfg.remoteProxyPort === 0) {
+      this.logger.warn(
+        `[${name}] injectServerEnv is on but remoteProxyPort is auto (0): the proxy port written to ` +
+          'server-env-setup will go stale when the tunnel reconnects. Set a fixed remoteProxyPort.',
+      );
+    }
     this.pendingApplies++;
     try {
       const httpPort = await this.ensureXray();

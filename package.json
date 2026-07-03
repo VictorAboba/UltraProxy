@@ -2,7 +2,7 @@
   "name": "ultraproxy",
   "displayName": "UltraProxy",
   "description": "Route Anthropic/OpenAI traffic from a Remote-SSH cluster through a local Xray (ss/ssconf/vless) proxy over a reverse SSH tunnel. Keeps local-network (vLLM) traffic direct.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "icon": "media/icon.png",
   "publisher": "ultraproxy",
   "license": "MIT",
@@ -215,7 +215,7 @@
               },
               "remoteProxyPort": {
                 "type": "number",
-                "description": "Cluster loopback port (0 = auto)."
+                "description": "Cluster loopback port. Omit to inherit ultraproxy.remoteProxyPort; an explicit 0 forces auto-assign for THIS cluster, overriding the global."
               },
               "vllmHost": {
                 "type": "array",
@@ -314,7 +314,7 @@
           "type": "number",
           "default": 0,
           "scope": "application",
-          "description": "Cluster loopback port the reverse tunnel binds to. 0 = auto-assign (recommended on shared clusters)."
+          "markdownDescription": "Cluster loopback port the reverse tunnel binds to. `0` = auto-assign — safe on shared hosts, but the port **changes on every reconnect**, which breaks anything that expects a stable proxy address. Use a **fixed** port (e.g. `1081`) with `injectServerEnv` (server-env-setup is only sourced at VS Code Server startup) or when the cluster env hardcodes the proxy URL."
         },
         "ultraproxy.localSocksPort": {
           "type": "number",

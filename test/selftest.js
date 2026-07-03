@@ -112,6 +112,14 @@ check('getClusters flat fallback', flat.length === 1 && flat[0].name === 'solo.e
 const cnp = resolveNoProxyForCluster({ ...flatDefaults }, multi[0]);
 check('cluster noProxy merges vllm', cnp.includes('global.lan') && cnp.includes('10.0.0.5'));
 
+// remoteProxyPort: absent inherits the global; an explicit 0 (auto) OVERRIDES a global fixed port.
+const rp = getClusters({
+  ...flatDefaults,
+  remoteProxyPort: 1081,
+  clusters: [{ host: 'a', user: 'v' }, { host: 'b', user: 'v', remoteProxyPort: 0 }, { host: 'c', user: 'v', remoteProxyPort: 2080 }],
+});
+check('remoteProxyPort inherit/override semantics', rp[0].remoteProxyPort === 1081 && rp[1].remoteProxyPort === 0 && rp[2].remoteProxyPort === 2080);
+
 const rawDup = [{ host: 'gpu1', user: 'a' }, { host: 'gpu1', user: 'b' }, { name: 'prod', host: 'x', user: 'a' }];
 check('resolvedClusterName dedups', resolvedClusterName(rawDup, 0) === 'gpu1' && resolvedClusterName(rawDup, 1) === 'gpu1-2' && resolvedClusterName(rawDup, 2) === 'prod');
 check('resolvedClusterName == getClusters names', getClusters({ ...flatDefaults, clusters: rawDup }).map((c) => c.name).join(',') === [0, 1, 2].map((i) => resolvedClusterName(rawDup, i)).join(','));
