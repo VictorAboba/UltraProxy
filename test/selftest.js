@@ -34,6 +34,7 @@ const {
   cmdUnwrapClaude,
 } = require(path.join(OUT, 'remote/scripts'));
 const { extractModelIds } = require(path.join(OUT, 'util/probe'));
+const { makeConnectConfig } = require(path.join(OUT, 'ssh/connect'));
 
 let failures = 0;
 function check(name, cond, extra) {
@@ -145,6 +146,28 @@ const wc = cmdWrapClaude('/home/u/.vscode-server/extensions');
 check('cmdWrapClaude', wc.includes('anthropic.claude-code-*') && wc.includes('claude.real') && wc.includes('ultraproxy-claude-wrapper'));
 check('cmdWrapClaude base64 not heredoc (wrap-safe)', wc.includes('base64 -d') && !wc.includes('UPWRAP') && !wc.includes('<<'));
 check('cmdUnwrapClaude restores', cmdUnwrapClaude('/x/extensions').includes('mv "$real" "$bin"'));
+
+// ---- ssh auth config (makeConnectConfig): an explicit method must NOT silently fall back to agent ----
+const FAKE_AGENT = '\\\\.\\pipe\\fake-agent'; // stand-in for the always-present Windows agent pipe
+const built = (auth) => makeConnectConfig({ host: 'h', port: 22, username: 'u', ...auth });
+const throwsWith = (fn, needle) => {
+  try { fn(); return false; } catch (e) { return String(e.message).includes(needle); }
+};
+const pwCfg = built({ authMethod: 'password', password: 's3cret', agentPath: FAKE_AGENT });
+check('connect password: password+keyboard order, agent NOT offered',
+  Array.isArray(pwCfg.config.authHandler) &&
+  pwCfg.config.authHandler.join(',') === 'password,keyboard-interactive' &&
+  pwCfg.config.agent === undefined && pwCfg.keyboardPassword === 's3cret',
+  pwCfg.config.authHandler);
+// The actual rost_dev bug: password chosen, none stored, agent pipe present -> must throw, not use agent.
+check('connect password missing throws (no silent agent fallback)',
+  throwsWith(() => built({ authMethod: 'password', agentPath: FAKE_AGENT }), 'Set SSH password'));
+check('connect key missing throws (no silent agent fallback)',
+  throwsWith(() => built({ authMethod: 'key', agentPath: FAKE_AGENT }), 'no private key'));
+const agCfg = built({ authMethod: 'agent', agentPath: FAKE_AGENT });
+check('connect agent: agent offered when chosen',
+  Array.isArray(agCfg.config.authHandler) && agCfg.config.authHandler.join(',') === 'agent' &&
+  agCfg.config.agent === FAKE_AGENT);
 
 // ---- probe helper ----
 check('extractModelIds', (extractModelIds(JSON.stringify({ data: [{ id: 'claude-opus-4' }, { id: 'gpt-5' }] })) || []).length === 2);

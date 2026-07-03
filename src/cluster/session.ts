@@ -5,6 +5,7 @@ import { detectRemote, RemoteInfo } from '../remote/detect';
 import { applyInjection, InjectResult, removeInjection } from '../remote/injector';
 import { RemoteExecProfile, wrapExec } from '../remote/scripts';
 import { makeConnectConfig, SshAuth } from '../ssh/connect';
+import { resolveAgentPath } from '../ssh/keys';
 import { CmdWrap, exec } from '../ssh/exec';
 import { SshTunnel } from '../ssh/tunnel';
 import { Logger } from '../util/logger';
@@ -207,7 +208,20 @@ export class ClusterSession {
       password,
       agentPath: this.cfg.agentPath,
     };
+    // Redacted auth diagnostics: never the secret itself (the logger also redacts it), just whether
+    // each credential actually resolved. If a 'password' cluster shows hasPassword=false here, the
+    // stored secret isn't being read under this cluster's name.
+    this.logger.info(
+      `${this.tag()} auth: method=${this.cfg.authMethod} hasPassword=${!!password} ` +
+        `hasKey=${!!this.cfg.privateKeyPath} hasAgent=${!!resolveAgentPath(this.cfg.agentPath)} ` +
+        `target=${this.cfg.user}@${this.cfg.host}:${this.cfg.port}`,
+    );
     const { config: connectConfig, keyboardPassword } = makeConnectConfig(auth);
+    this.logger.info(
+      `${this.tag()} ssh auth order: ${
+        Array.isArray(connectConfig.authHandler) ? connectConfig.authHandler.join(' > ') : 'default'
+      }`,
+    );
 
     // ProxyJump: build a bastion connection reusing the cluster's own credentials. The bastion's own
     // port defaults to 22 (like `ssh -J`), independent of the cluster's SSH port, unless the spec
