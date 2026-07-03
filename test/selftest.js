@@ -1,5 +1,7 @@
 /* Behavioral self-test against the compiled extension modules. Run: npm test (after npm run compile). */
 const path = require('path');
+const os = require('os');
+const fs = require('fs');
 const Module = require('module');
 
 // Stub 'vscode' so modules that import it can load in plain Node.
@@ -35,6 +37,7 @@ const {
 } = require(path.join(OUT, 'remote/scripts'));
 const { extractModelIds } = require(path.join(OUT, 'util/probe'));
 const { makeConnectConfig } = require(path.join(OUT, 'ssh/connect'));
+const { InstanceCoordinator } = require(path.join(OUT, 'cluster/coordinator'));
 
 let failures = 0;
 function check(name, cond, extra) {
@@ -168,6 +171,42 @@ const agCfg = built({ authMethod: 'agent', agentPath: FAKE_AGENT });
 check('connect agent: agent offered when chosen',
   Array.isArray(agCfg.config.authHandler) && agCfg.config.authHandler.join(',') === 'agent' &&
   agCfg.config.agent === FAKE_AGENT);
+
+// ---- cross-window coordinator (InstanceCoordinator): one owner per cluster across VSCode windows ----
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ultraproxy-coord-'));
+  const clock = { t: 1000 };
+  const now = () => clock.t;
+  const mk = (id, pid) => new InstanceCoordinator(tmp, { id, pid, now, staleMs: 100, heartbeatMs: 1000 });
+  const A = mk('A', 111);
+  const B = mk('B', 222);
+
+  check('coord: A claims a free cluster', A.claim('c1') === true);
+  check('coord: B is blocked while A is live', B.claim('c1') === false);
+  check('coord: B sees A as the foreign owner', (() => { const f = B.foreignOwner('c1'); return !!f && f.pid === 111; })());
+  A.setBoundPort('c1', 33165);
+  check('coord: foreign boundPort is visible to B', (B.foreignOwner('c1') || {}).boundPort === 33165);
+  check('coord: A can re-claim its own cluster', A.claim('c1') === true);
+
+  A.release('c1');
+  check('coord: after release, no foreign owner', B.foreignOwner('c1') === undefined);
+  check('coord: B can claim after A released', B.claim('c1') === true);
+
+  // stale takeover: A owns c2, clock jumps past staleMs with no heartbeat -> B may take over
+  check('coord: A claims c2', A.claim('c2') === true);
+  check('coord: B blocked while A fresh on c2', B.claim('c2') === false);
+  clock.t += 500; // > staleMs (100) with no heartbeat -> A is now stale
+  check('coord: B takes over stale (dead-window) c2', B.claim('c2') === true);
+  check('coord: A now sees B as foreign owner of c2', (() => { const f = A.foreignOwner('c2'); return !!f && f.owner === 'B'; })());
+
+  // dispose releases this instance's remaining claims and fails open afterward
+  A.claim('c3');
+  A.dispose();
+  check('coord: dispose releases owned claims', B.foreignOwner('c3') === undefined);
+  check('coord: disposed instance fails open (claim=true)', A.claim('c3') === true);
+
+  try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+}
 
 // ---- probe helper ----
 check('extractModelIds', (extractModelIds(JSON.stringify({ data: [{ id: 'claude-opus-4' }, { id: 'gpt-5' }] })) || []).length === 2);

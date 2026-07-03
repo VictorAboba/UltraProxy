@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { ClusterSession, ProviderTest } from './cluster/session';
+import { InstanceCoordinator } from './cluster/coordinator';
 import { Secrets } from './config/secrets';
 import { ClusterConfig, getClusters, readSettings, resolveNoProxyForCluster } from './config/settings';
 import { Logger } from './util/logger';
@@ -23,13 +24,18 @@ export class Orchestrator {
   private xrayQueue: Promise<unknown> = Promise.resolve();
   private pendingApplies = 0;
   private readonly sessions = new Map<string, ClusterSession>();
+  /** Cross-window ownership so peer windows don't duplicate this window's tunnels (see coordinator.ts). */
+  private readonly coordinator: InstanceCoordinator;
 
   constructor(
     private readonly ctx: vscode.ExtensionContext,
     private readonly logger: Logger,
     private readonly secrets: Secrets,
     private readonly status: StatusBar,
-  ) {}
+  ) {
+    this.coordinator = new InstanceCoordinator(ctx.globalStorageUri.fsPath);
+    this.coordinator.start();
+  }
 
   clusters(): ClusterConfig[] {
     return getClusters(readSettings());
@@ -45,7 +51,10 @@ export class Orchestrator {
 
   sessionStateOf(name: string): string {
     const s = this.sessions.get(name);
-    return s ? s.state : 'off';
+    if (s) {
+      return s.state;
+    }
+    return this.coordinator.foreignOwner(name) ? 'on (another window)' : 'off';
   }
 
   // ---- shared Xray lifecycle (serialized) -------------------------------------------------
@@ -125,10 +134,22 @@ export class Orchestrator {
 
   // ---- per-cluster operations -------------------------------------------------------------
 
-  async applyCluster(name: string): Promise<void> {
+  async applyCluster(name: string, opts: { notifyIfForeign?: boolean } = {}): Promise<void> {
     const cfg = this.clusters().find((c) => c.name === name);
     if (!cfg) {
       throw new Error(`No cluster named "${name}" is configured.`);
+    }
+    // Another live VSCode window may already own this cluster's tunnel. Don't start a second one
+    // (it would fight over ports and double-inject); reflect its state instead of reporting "off".
+    if (!this.coordinator.claim(name)) {
+      const f = this.coordinator.foreignOwner(name);
+      const where = `another VSCode window (pid ${f?.pid ?? '?'}${f?.boundPort ? `, 127.0.0.1:${f.boundPort}` : ''})`;
+      this.logger.info(`[${name}] already active in ${where}; not starting a second tunnel here.`);
+      if (opts.notifyIfForeign !== false) {
+        this.notice(`Cluster "${name}" is already active in ${where}. Reusing that tunnel — not applying again here.`);
+      }
+      this.refreshStatus();
+      return;
     }
     this.pendingApplies++;
     try {
@@ -149,7 +170,10 @@ export class Orchestrator {
         noProxy,
         allowLegacySecret: this.clusters().length === 1,
       });
+      this.coordinator.setBoundPort(name, session.boundRemotePort);
     } catch (e) {
+      // Failed to establish — free the claim so another window can try this cluster.
+      this.coordinator.release(name);
       this.reportError(e as Error);
     } finally {
       this.pendingApplies--;
@@ -165,6 +189,7 @@ export class Orchestrator {
     }
     await session.remove();
     this.sessions.delete(name);
+    this.coordinator.release(name);
     this.refreshStatus();
     await this.stopXrayIfIdle();
   }
@@ -179,7 +204,9 @@ export class Orchestrator {
     if (cfgs.length === 0) {
       throw new Error('No clusters configured. Set ultraproxy.clusters or the SSH host/user.');
     }
-    await Promise.allSettled(cfgs.map((c) => this.applyCluster(c.name)));
+    // notifyIfForeign=false: skipping a peer-owned cluster is normal here — log it, don't pop a
+    // dialog per cluster (the status bar already reflects the peer-owned ones as active).
+    await Promise.allSettled(cfgs.map((c) => this.applyCluster(c.name, { notifyIfForeign: false })));
   }
 
   async removeAll(): Promise<void> {
@@ -209,8 +236,15 @@ export class Orchestrator {
 
   private refreshStatus(): void {
     const sessions = [...this.sessions.values()];
-    const total = this.clusters().length;
-    const active = sessions.filter((s) => s.isActive()).length;
+    const cfgs = this.clusters();
+    const total = cfgs.length;
+    const localActive = sessions.filter((s) => s.isActive()).length;
+    // Count clusters a peer window owns (and that we aren't locally running) as active too, so the
+    // status bar reflects reality instead of showing "off" for a cluster another window is proxying.
+    const foreignActive = cfgs.filter(
+      (c) => !this.sessions.get(c.name)?.isActive() && this.coordinator.foreignOwner(c.name),
+    ).length;
+    const active = localActive + foreignActive;
     const starting = this.pendingApplies > 0 || sessions.some((s) => s.state === 'starting');
     const error = active === 0 && sessions.some((s) => s.state === 'error');
     this.status.setSummary({ active, total, starting, error });
@@ -248,12 +282,20 @@ export class Orchestrator {
     return cfgs
       .map((c) => {
         const s = this.sessions.get(c.name);
-        return `${c.name}: ${s ? s.describe() : 'off'}`;
+        if (s) {
+          return `${c.name}: ${s.describe()}`;
+        }
+        const f = this.coordinator.foreignOwner(c.name);
+        if (f) {
+          return `${c.name}: on — another window (pid ${f.pid}${f.boundPort ? `, 127.0.0.1:${f.boundPort}` : ''})`;
+        }
+        return `${c.name}: off`;
       })
       .join('\n');
   }
 
   async dispose(): Promise<void> {
+    this.coordinator.dispose(); // release our cluster ownership so peer windows can take over
     await Promise.allSettled([...this.sessions.values()].map((s) => s.disposeLocal()));
     this.sessions.clear();
     await this.xEnqueue(async () => {
