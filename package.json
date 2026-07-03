@@ -2,7 +2,7 @@
   "name": "ultraproxy",
   "displayName": "UltraProxy",
   "description": "Route Anthropic/OpenAI traffic from a Remote-SSH cluster through a local Xray (ss/ssconf/vless) proxy over a reverse SSH tunnel. Keeps local-network (vLLM) traffic direct.",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "icon": "media/icon.png",
   "publisher": "ultraproxy",
   "license": "MIT",

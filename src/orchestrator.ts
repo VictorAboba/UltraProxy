@@ -49,6 +49,13 @@ export class Orchestrator {
     return [...this.sessions.values()].filter((s) => s.isActive()).map((s) => s.name);
   }
 
+  /** Clusters a LIVE peer window owns (and this one doesn't run) — active, but not testable here. */
+  foreignOwnedNames(): string[] {
+    return this.clusters()
+      .filter((c) => !this.sessions.get(c.name)?.isActive() && this.coordinator.foreignOwner(c.name))
+      .map((c) => c.name);
+  }
+
   sessionStateOf(name: string): string {
     const s = this.sessions.get(name);
     if (s) {

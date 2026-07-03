@@ -131,6 +131,16 @@ async function restartCmd(): Promise<void> {
 async function testCmd(): Promise<void> {
   const names = orchestrator.activeSessionNames();
   if (names.length === 0) {
+    // The test needs this window's SSH connection; a cluster owned by ANOTHER window is active but
+    // not testable from here — say so instead of the misleading "not active".
+    const foreign = orchestrator.foreignOwnedNames();
+    if (foreign.length > 0) {
+      vscode.window.showInformationMessage(
+        `UltraProxy: ${foreign.map((n) => `"${n}"`).join(', ')} ${foreign.length === 1 ? 'is' : 'are'} managed by another VSCode window. ` +
+          'The tunnel is active; run "Test Connection" from that window to probe it.',
+      );
+      return;
+    }
     const choice = await vscode.window.showWarningMessage(
       'UltraProxy is not active. Apply a cluster first, then test.',
       'Apply',
