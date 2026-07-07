@@ -28,6 +28,10 @@ export interface TunnelHooks {
 }
 
 const MAX_BACKOFF_MS = 30000;
+// Start the first reconnect attempt quickly: a transient reset (ECONNRESET) usually re-establishes
+// immediately, and every second of gap is a window where a cluster request (e.g. a Claude token
+// refresh) can fail. Subsequent attempts back off toward MAX so a genuinely-down host isn't hammered.
+const INITIAL_BACKOFF_MS = 250;
 
 /**
  * A reverse SSH tunnel (equivalent to `ssh -R`) with auto-reconnect.
@@ -40,7 +44,7 @@ export class SshTunnel {
   private everReady = false;
   /** True while a main client is connected (used to decide if a bastion error must self-reschedule). */
   private mainAlive = false;
-  private backoff = 1000;
+  private backoff = INITIAL_BACKOFF_MS;
   private reconnectTimer?: NodeJS.Timeout;
 
   constructor(
@@ -51,7 +55,7 @@ export class SshTunnel {
 
   start(): void {
     this.stopped = false;
-    this.backoff = 1000;
+    this.backoff = INITIAL_BACKOFF_MS;
     this.connect();
   }
 
@@ -189,7 +193,7 @@ export class SshTunnel {
       this.logger.info('SSH connection ready.');
       this.everReady = true;
       this.mainAlive = true;
-      this.backoff = 1000;
+      this.backoff = INITIAL_BACKOFF_MS;
       client.forwardIn(this.opts.remoteBindAddr, this.opts.remotePort, (err, boundPort) => {
         if (err) {
           this.logger.error('Reverse forward failed', err);
@@ -285,7 +289,7 @@ export class SshTunnel {
     }
     const delay = this.backoff;
     this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);
-    this.logger.warn(`SSH closed; reconnecting in ${Math.round(delay / 1000)}s`);
+    this.logger.warn(`SSH closed; reconnecting in ${delay < 1000 ? `${delay}ms` : `${Math.round(delay / 1000)}s`}`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       this.connect();

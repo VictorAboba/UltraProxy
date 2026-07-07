@@ -284,6 +284,16 @@ export class ClusterSession {
             try {
               const wrap = this.execWrap();
               this.boundPort = boundPort;
+              // lastBoundPort is set ONLY after a successful injection, so it doubles as "already
+              // applied on this exact port". A transient tunnel reset that reconnects on the SAME
+              // (fixed) port needs no re-injection: env.sh, rc guards, patched settings and
+              // server-env-setup all persist on the cluster's disk across the blip. Skip the heavy
+              // re-exec — it just added churn (and log spam) on every reconnect — and restore fast.
+              if (this.lastBoundPort !== 0 && this.lastBoundPort === boundPort) {
+                this.setState('on');
+                this.logger.info(`${this.tag()} reconnected; http://127.0.0.1:${boundPort} still applied.`);
+                return;
+              }
               if (!this.remoteInfo) {
                 this.remoteInfo = await detectRemote(client, wrap);
                 this.logger.info(
